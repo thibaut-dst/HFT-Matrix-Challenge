@@ -1,0 +1,10 @@
+# runtime
+/logs/
+/build/
+/*.pid
+client_pids.txt
+/tmp/results.json
+/cmake-build-debug/
+/HFTDashboard/.venv
+
+

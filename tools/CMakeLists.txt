@@ -1,0 +1,9 @@
+add_executable(blast_server blast_server.cpp)
+set_target_properties(blast_server PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_link_libraries(blast_server PRIVATE pthread)
+target_link_libraries(blast_server PRIVATE nlohmann_json::nlohmann_json)
+
+# tools/CMakeLists.txt
+add_executable(hftclient_concurrent client_concurrent.cpp)
+set_target_properties(hftclient_concurrent PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+target_link_libraries(hftclient_concurrent PRIVATE pthread)
