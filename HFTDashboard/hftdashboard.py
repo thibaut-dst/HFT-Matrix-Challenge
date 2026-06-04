@@ -8,7 +8,7 @@ import plotly.graph_objs as go
 import numpy as np
 
 # Specify the absolute path to your results file.
-RESULTS_FILE = "/Users/sdonadio/CLionProjects/HFTProject/build/results.json"
+RESULTS_FILE = "/tmp/results.json"
 
 # Create a Flask server instance.
 server = Flask(__name__)
