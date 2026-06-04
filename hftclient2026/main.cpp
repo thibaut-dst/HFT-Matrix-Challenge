@@ -20,9 +20,9 @@ int main(int argc, char** argv) {
     int port = stoi(argv[2]);
     string team = argv[3];
 
-    cout << "HFT Client Template\n";
-    cout << "This client connects but does NOT solve challenges.\n";
-    cout << "You must implement the real logic.\n\n";
+    // cout << "HFT Client Template\n";
+    // cout << "This client connects but does NOT solve challenges.\n";
+    // cout << "You must implement the real logic.\n\n";
 
     // --- Connect to server ---
     int sock = socket(AF_INET, SOCK_STREAM, 0);
@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     cout << "Connected to server at " << host << ":" << port << "\n";
     cout << "Waiting for challenges...\n";
 
-    char buffer[65536];
+    char buffer[262144];
 
     while (true) {
         int n = recv(sock, buffer, sizeof(buffer)-1, 0);
@@ -56,21 +56,53 @@ int main(int argc, char** argv) {
             cout << "Disconnected from server.\n";
             break;
         }
-
         buffer[n] = '\0';
         string msg(buffer);
 
-        // Fake parsing
-        cout << "[DEBUG] Received challenge (" << n << " bytes)\n";
 
-        // Pretend to compute something
-        this_thread::sleep_for(chrono::milliseconds(5));
 
-        // Always send wrong answer
-        string fake = "0 0\n";
-        send(sock, fake.c_str(), fake.size(), 0);
 
-        cout << "[DEBUG] Sent fake answer\n";
+        istringstream iss(msg); // iss = input string stream - allows us to parse the message easily
+        int challenge_id, N;
+        iss >> challenge_id >> N;
+
+        vector<vector<int>> A(N, vector<int>(N));
+        vector<vector<int>> B(N, vector<int>(N));
+
+        for (int i = 0; i < N; i++){
+            for (int j = 0; j < N; j++){
+                iss >> A[i][j];
+            }
+        }
+        for (int i = 0; i < N; i++){
+            for (int j = 0; j < N; j++){
+                iss >> B[i][j];
+            }
+        }
+
+        vector<vector<int>> C(N, vector<int>(N, 0));
+
+        for (int i = 0; i < N; i++) {
+            for (int k = 0; k < N; k++) {
+                int aik = A[i][k];
+                for (int j = 0; j < N; j++) {
+                    C[i][j] = (C[i][j] + aik * B[k][j]) % 997;
+                }
+            }
+        }
+
+        // checksum
+        int checksum = 0;
+        for (int i = 0; i < N; i++){
+            for (int j = 0; j < N; j++){
+                checksum = (checksum + C[i][j]) % 997;
+            }
+        }
+        
+
+        string response = to_string(challenge_id) + " " + to_string(checksum) + "\n";
+        send(sock, response.c_str(), response.size(), 0);
+
     }
 
     close(sock);
