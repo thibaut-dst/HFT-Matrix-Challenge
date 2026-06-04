@@ -10,6 +10,62 @@
 
 using namespace std;
 
+struct ChallengeData {
+    int challenge_id = 0;
+    int N = 0;
+    vector<vector<int>> A;
+    vector<vector<int>> B;
+};
+
+static bool parseChallengeFromBuffer(const string& pending, ChallengeData& out, size_t& consumed) {
+    istringstream iss(pending);
+
+    int challenge_id = 0;
+    int N = 0;
+    if (!(iss >> challenge_id >> N)) {
+        return false;
+    }
+
+    if (N <= 0) {
+        return false;
+    }
+
+    vector<vector<int>> A(N, vector<int>(N));
+    vector<vector<int>> B(N, vector<int>(N));
+
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            if (!(iss >> A[i][j])) {
+                return false;
+            }
+        }
+    }
+
+    for (int i = 0; i < N; ++i) {
+        for (int j = 0; j < N; ++j) {
+            if (!(iss >> B[i][j])) {
+                return false;
+            }
+        }
+    }
+
+    out.challenge_id = challenge_id;
+    out.N = N;
+    out.A = std::move(A);
+    out.B = std::move(B);
+
+    consumed = static_cast<size_t>(iss.tellg());
+    if (consumed == string::npos) {
+        consumed = pending.size();
+    }
+
+    while (consumed < pending.size() && isspace(static_cast<unsigned char>(pending[consumed]))) {
+        ++consumed;
+    }
+
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc < 4) {
         cout << "Usage: " << argv[0] << " <host> <port> <team_name>\n";
@@ -49,6 +105,7 @@ int main(int argc, char** argv) {
     cout << "Waiting for challenges...\n";
 
     char buffer[262144];
+    string pending;
 
     while (true) {
         int n = recv(sock, buffer, sizeof(buffer)-1, 0);
@@ -56,52 +113,38 @@ int main(int argc, char** argv) {
             cout << "Disconnected from server.\n";
             break;
         }
-        buffer[n] = '\0';
-        string msg(buffer);
+        pending.append(buffer, n);
 
-
-
-
-        istringstream iss(msg); // iss = input string stream - allows us to parse the message easily
-        int challenge_id, N;
-        iss >> challenge_id >> N;
-
-        vector<vector<int>> A(N, vector<int>(N));
-        vector<vector<int>> B(N, vector<int>(N));
-
-        for (int i = 0; i < N; i++){
-            for (int j = 0; j < N; j++){
-                iss >> A[i][j];
+        while (true) {
+            ChallengeData challenge;
+            size_t consumed = 0;
+            if (!parseChallengeFromBuffer(pending, challenge, consumed)) {
+                break;
             }
-        }
-        for (int i = 0; i < N; i++){
-            for (int j = 0; j < N; j++){
-                iss >> B[i][j];
-            }
-        }
 
-        vector<vector<int>> C(N, vector<int>(N, 0));
+            pending.erase(0, consumed);
 
-        for (int i = 0; i < N; i++) {
-            for (int k = 0; k < N; k++) {
-                int aik = A[i][k];
-                for (int j = 0; j < N; j++) {
-                    C[i][j] = (C[i][j] + aik * B[k][j]) % 997;
+            vector<vector<int>> C(challenge.N, vector<int>(challenge.N, 0));
+
+            for (int i = 0; i < challenge.N; i++) {
+                for (int k = 0; k < challenge.N; k++) {
+                    int aik = challenge.A[i][k];
+                    for (int j = 0; j < challenge.N; j++) {
+                        C[i][j] = (C[i][j] + aik * challenge.B[k][j]) % 997;
+                    }
                 }
             }
-        }
 
-        // checksum
-        int checksum = 0;
-        for (int i = 0; i < N; i++){
-            for (int j = 0; j < N; j++){
-                checksum = (checksum + C[i][j]) % 997;
+            int checksum = 0;
+            for (int i = 0; i < challenge.N; i++) {
+                for (int j = 0; j < challenge.N; j++) {
+                    checksum = (checksum + C[i][j]) % 997;
+                }
             }
-        }
-        
 
-        string response = to_string(challenge_id) + " " + to_string(checksum) + "\n";
-        send(sock, response.c_str(), response.size(), 0);
+            string response = to_string(challenge.challenge_id) + " " + to_string(checksum) + "\n";
+            send(sock, response.c_str(), response.size(), 0);
+        }
 
     }
 
