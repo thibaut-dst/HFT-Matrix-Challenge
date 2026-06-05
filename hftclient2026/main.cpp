@@ -4,8 +4,9 @@
 #include <atomic>
 #include <cctype>
 #include <cerrno>
+#include <chrono>
+#include <cstdio>
 #include <cstring>
-#include <iostream>
 #include <netinet/in.h>
 #include <string>
 #include <thread>
@@ -13,14 +14,26 @@
 #include <vector>
 
 using namespace std;
+using namespace std::chrono;
 
 namespace {
 constexpr size_t kRingBufferCapacity = 1u << 20; // 1 MiB
 constexpr int kModulo = 997;
 constexpr int kComputeWorkers = 7;
 constexpr int kMaxMatrixDim = 512;
+constexpr int kComputeTile = 32;
 constexpr size_t kMaxCells = static_cast<size_t>(kMaxMatrixDim) * static_cast<size_t>(kMaxMatrixDim);
 } // namespace
+
+struct BenchmarkStats {
+    atomic<uint64_t> challenges{0};
+    atomic<uint64_t> bytes{0};
+    atomic<uint64_t> parse_wall_ns{0};
+    atomic<uint64_t> parse_cpu_ns{0};
+    atomic<uint64_t> compute_wait_ns{0};
+    atomic<uint64_t> send_ns{0};
+    atomic<uint64_t> latency_ns{0};
+};
 
 struct SharedJob {
     int challenge_id = 0;
@@ -106,8 +119,8 @@ public:
 private:
     vector<char> buffer_;
     const size_t mask_;
-    atomic<size_t> head_{0}; // producer-owned
-    atomic<size_t> tail_{0}; // consumer-owned
+    atomic<size_t> head_{0};
+    atomic<size_t> tail_{0};
     atomic<bool> closed_{false};
     atomic<uint64_t> writer_waits_{0};
     atomic<uint64_t> reader_waits_{0};
@@ -115,7 +128,8 @@ private:
 
 class ChallengeParser {
 public:
-    explicit ChallengeParser(SharedJob& job) : job_(job) {}
+    explicit ChallengeParser(SharedJob& job, bool benchmark_enabled)
+        : job_(job), benchmark_enabled_(benchmark_enabled) {}
 
     size_t feed(const char* data, size_t len) {
         size_t i = 0;
@@ -137,6 +151,15 @@ public:
         a_index_ = 0;
         b_index_ = 0;
         completed_ = false;
+        challenge_started_ = false;
+    }
+
+    bool challengeStarted() const {
+        return challenge_started_;
+    }
+
+    steady_clock::time_point challengeStartTime() const {
+        return challenge_start_;
     }
 
 private:
@@ -149,6 +172,11 @@ private:
 
     void processChar(char c) {
         const unsigned char uc = static_cast<unsigned char>(c);
+
+        if (benchmark_enabled_ && !challenge_started_ && !isspace(uc)) {
+            challenge_start_ = steady_clock::now();
+            challenge_started_ = true;
+        }
 
         if (isdigit(uc)) {
             if (!in_number_) {
@@ -240,6 +268,9 @@ private:
     size_t a_index_ = 0;
     size_t b_index_ = 0;
     bool completed_ = false;
+    bool benchmark_enabled_ = false;
+    bool challenge_started_ = false;
+    steady_clock::time_point challenge_start_{};
 };
 
 static bool sendAll(int sock, const string& msg) {
@@ -264,20 +295,25 @@ static int computePartialChecksum(const SharedJob& job, int worker_id) {
     const size_t end_row = (static_cast<size_t>(worker_id + 1) * static_cast<size_t>(N)) / kComputeWorkers;
 
     int partial = 0;
-    for (size_t i = start_row; i < end_row; ++i) {
-        const size_t row_base = i * static_cast<size_t>(N);
-        for (int j = 0; j < N; ++j) {
-            int cij = 0;
-            for (int k = 0; k < N; ++k) {
-                const int term = static_cast<int>((1LL * job.A[row_base + static_cast<size_t>(k)] * job.B[static_cast<size_t>(k) * static_cast<size_t>(N) + static_cast<size_t>(j)]) % kModulo);
-                cij += term;
-                if (cij >= kModulo) {
-                    cij -= kModulo;
+    for (size_t ii = start_row; ii < end_row; ii += static_cast<size_t>(kComputeTile)) {
+        const size_t i_end = min(end_row, ii + static_cast<size_t>(kComputeTile));
+        for (int kk = 0; kk < N; kk += kComputeTile) {
+            const int k_end = min(N, kk + kComputeTile);
+            for (int jj = 0; jj < N; jj += kComputeTile) {
+                const int j_end = min(N, jj + kComputeTile);
+                for (size_t i = ii; i < i_end; ++i) {
+                    const size_t row_base = i * static_cast<size_t>(N);
+                    for (int k = kk; k < k_end; ++k) {
+                        const int a = job.A[row_base + static_cast<size_t>(k)];
+                        const size_t b_base = static_cast<size_t>(k) * static_cast<size_t>(N);
+                        for (int j = jj; j < j_end; ++j) {
+                            partial += static_cast<int>((1LL * a * job.B[b_base + static_cast<size_t>(j)]) % kModulo);
+                            if (partial >= kModulo) {
+                                partial -= kModulo;
+                            }
+                        }
+                    }
                 }
-            }
-            partial += cij;
-            if (partial >= kModulo) {
-                partial -= kModulo;
             }
         }
     }
@@ -285,7 +321,7 @@ static int computePartialChecksum(const SharedJob& job, int worker_id) {
     return partial;
 }
 
-static void ioReceiverThread(int sock, SpscRingBuffer& ring, atomic<bool>& stop_requested) {
+static void ioReceiverThread(int sock, SpscRingBuffer& ring, atomic<bool>& stop_requested, BenchmarkStats* stats) {
     while (!stop_requested.load(memory_order_relaxed)) {
         size_t span = 0;
         char* dst = ring.reserveWriteSpan(span);
@@ -299,6 +335,9 @@ static void ioReceiverThread(int sock, SpscRingBuffer& ring, atomic<bool>& stop_
 
         const ssize_t n = recv(sock, dst, span, 0);
         if (n > 0) {
+            if (stats != nullptr) {
+                stats->bytes.fetch_add(static_cast<uint64_t>(n), memory_order_relaxed);
+            }
             ring.commitWrite(static_cast<size_t>(n));
             continue;
         }
@@ -333,8 +372,8 @@ static void workerThread(int worker_id, SharedJob& job, atomic<bool>& stop_reque
     }
 }
 
-static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& stop_requested, int sock) {
-    ChallengeParser parser(job);
+static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& stop_requested, int sock, BenchmarkStats* stats) {
+    ChallengeParser parser(job, stats != nullptr);
 
     while (!stop_requested.load(memory_order_relaxed)) {
         size_t span = 0;
@@ -347,13 +386,25 @@ static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& sto
             continue;
         }
 
+        const auto parse_cpu_start = stats != nullptr ? steady_clock::now() : steady_clock::time_point{};
         const size_t consumed = parser.feed(src, span);
+        if (stats != nullptr) {
+            const auto parse_cpu_end = steady_clock::now();
+            stats->parse_cpu_ns.fetch_add(static_cast<uint64_t>(duration_cast<nanoseconds>(parse_cpu_end - parse_cpu_start).count()),
+                                          memory_order_relaxed);
+        }
         ring.consume(consumed);
-
         if (!parser.completed()) {
             continue;
         }
 
+        const auto parse_complete = steady_clock::now();
+        if (stats != nullptr && parser.challengeStarted()) {
+            stats->parse_wall_ns.fetch_add(static_cast<uint64_t>(duration_cast<nanoseconds>(parse_complete - parser.challengeStartTime()).count()),
+                                           memory_order_relaxed);
+        }
+
+        const auto compute_start = parse_complete;
         job.done_count.store(0, memory_order_release);
         job.epoch.fetch_add(1, memory_order_release);
 
@@ -362,6 +413,12 @@ static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& sto
                 break;
             }
             this_thread::yield();
+        }
+
+        if (stats != nullptr) {
+            const auto compute_end = steady_clock::now();
+            stats->compute_wait_ns.fetch_add(static_cast<uint64_t>(duration_cast<nanoseconds>(compute_end - compute_start).count()),
+                                             memory_order_relaxed);
         }
 
         int checksum = 0;
@@ -373,9 +430,24 @@ static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& sto
         }
 
         const string response = to_string(job.challenge_id) + " " + to_string(checksum) + "\n";
+        steady_clock::time_point send_start;
+        if (stats != nullptr) {
+            send_start = steady_clock::now();
+        }
         if (!sendAll(sock, response)) {
             stop_requested.store(true, memory_order_relaxed);
             break;
+        }
+
+        if (stats != nullptr) {
+            const auto send_end = steady_clock::now();
+            stats->send_ns.fetch_add(static_cast<uint64_t>(duration_cast<nanoseconds>(send_end - send_start).count()),
+                                     memory_order_relaxed);
+            if (parser.challengeStarted()) {
+                stats->latency_ns.fetch_add(static_cast<uint64_t>(duration_cast<nanoseconds>(send_end - parser.challengeStartTime()).count()),
+                                            memory_order_relaxed);
+            }
+            stats->challenges.fetch_add(1, memory_order_relaxed);
         }
 
         parser.reset();
@@ -383,14 +455,15 @@ static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& sto
 }
 
 int main(int argc, char** argv) {
-    if (argc < 4) {
-        cout << "Usage: " << argv[0] << " <host> <port> <team_name>\n";
+    if (argc < 4 || argc > 5) {
+        fprintf(stderr, "Usage: %s <host> <port> <team_name> [--benchmark]\n", argv[0]);
         return 1;
     }
 
     const string host = argv[1];
     const int port = stoi(argv[2]);
     const string team = argv[3];
+    const bool benchmark_enabled = (argc == 5 && string(argv[4]) == "--benchmark");
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -402,7 +475,7 @@ int main(int argc, char** argv) {
     addr.sin_family = AF_INET;
     addr.sin_port = htons(port);
     if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
-        cerr << "Invalid host address: " << host << '\n';
+        fprintf(stderr, "Invalid host address: %s\n", host.c_str());
         close(sock);
         return 1;
     }
@@ -415,25 +488,24 @@ int main(int argc, char** argv) {
 
     const string intro = team + "\n";
     if (!sendAll(sock, intro)) {
-        cerr << "Failed to send team name.\n";
+        fprintf(stderr, "Failed to send team name.\n");
         close(sock);
         return 1;
     }
 
-    cout << "Connected to server at " << host << ":" << port << '\n';
-    cout << "Waiting for challenges...\n";
-
     SharedJob job;
     SpscRingBuffer ring(kRingBufferCapacity);
     atomic<bool> stop_requested{false};
+    BenchmarkStats benchmark_stats;
+    BenchmarkStats* stats_ptr = benchmark_enabled ? &benchmark_stats : nullptr;
 
     array<thread, kComputeWorkers> workers;
     for (int i = 0; i < kComputeWorkers; ++i) {
         workers[i] = thread(workerThread, i, ref(job), ref(stop_requested));
     }
 
-    thread io_thread(ioReceiverThread, sock, ref(ring), ref(stop_requested));
-    thread parse_thread(parserThread, ref(ring), ref(job), ref(stop_requested), sock);
+    thread io_thread(ioReceiverThread, sock, ref(ring), ref(stop_requested), stats_ptr);
+    thread parse_thread(parserThread, ref(ring), ref(job), ref(stop_requested), sock, stats_ptr);
 
     io_thread.join();
     parse_thread.join();
@@ -449,7 +521,33 @@ int main(int argc, char** argv) {
 
     close(sock);
 
-    cout << "Ring writer waits: " << ring.writerWaits() << '\n';
-    cout << "Ring reader waits: " << ring.readerWaits() << '\n';
+    if (benchmark_enabled) {
+        const uint64_t challenges = benchmark_stats.challenges.load(memory_order_relaxed);
+        const uint64_t bytes = benchmark_stats.bytes.load(memory_order_relaxed);
+        const uint64_t parse_wall_ns = benchmark_stats.parse_wall_ns.load(memory_order_relaxed);
+        const uint64_t parse_cpu_ns = benchmark_stats.parse_cpu_ns.load(memory_order_relaxed);
+        const uint64_t compute_wait_ns = benchmark_stats.compute_wait_ns.load(memory_order_relaxed);
+        const uint64_t send_ns = benchmark_stats.send_ns.load(memory_order_relaxed);
+        const uint64_t latency_ns = benchmark_stats.latency_ns.load(memory_order_relaxed);
+        const double avg_latency_ms = challenges == 0 ? 0.0 : (latency_ns / 1e6) / static_cast<double>(challenges);
+        const double avg_parse_wall_ms = challenges == 0 ? 0.0 : (parse_wall_ns / 1e6) / static_cast<double>(challenges);
+        const double avg_parse_cpu_ms = challenges == 0 ? 0.0 : (parse_cpu_ns / 1e6) / static_cast<double>(challenges);
+        const double avg_compute_ms = challenges == 0 ? 0.0 : (compute_wait_ns / 1e6) / static_cast<double>(challenges);
+        const double avg_send_ms = challenges == 0 ? 0.0 : (send_ns / 1e6) / static_cast<double>(challenges);
+
+        fprintf(stderr,
+                "[bench] challenges=%llu bytes=%llu total_latency_ms=%.3f avg_latency_ms=%.3f parse_wall_ms=%.3f parse_cpu_ms=%.3f compute_ms=%.3f send_ms=%.3f ring_writer_waits=%llu ring_reader_waits=%llu\n",
+                static_cast<unsigned long long>(challenges),
+                static_cast<unsigned long long>(bytes),
+                latency_ns / 1e6,
+                avg_latency_ms,
+                avg_parse_wall_ms,
+                avg_parse_cpu_ms,
+                avg_compute_ms,
+                avg_send_ms,
+                static_cast<unsigned long long>(ring.writerWaits()),
+                static_cast<unsigned long long>(ring.readerWaits()));
+    }
+
     return 0;
 }
