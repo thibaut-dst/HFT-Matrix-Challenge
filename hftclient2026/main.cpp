@@ -23,7 +23,7 @@ using namespace std;
 using namespace std::chrono;
 
 namespace {
-constexpr size_t kRingBufferCapacity = 1u << 20; // 1 MiB
+constexpr size_t kRingBufferCapacity = 1u << 22; // 4 MiB
 constexpr int kModulo = 997;
 constexpr int kComputeWorkers = 8;
 constexpr int kMaxMatrixDim = 512;
