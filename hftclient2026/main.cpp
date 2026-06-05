@@ -1,15 +1,12 @@
+#include <algorithm>
+#include <array>
 #include <arpa/inet.h>
 #include <atomic>
-#include <cerrno>
 #include <cctype>
-#include <chrono>
-#include <condition_variable>
+#include <cerrno>
 #include <cstring>
 #include <iostream>
-#include <memory>
-#include <mutex>
 #include <netinet/in.h>
-#include <queue>
 #include <string>
 #include <thread>
 #include <unistd.h>
@@ -18,157 +15,128 @@
 using namespace std;
 
 namespace {
-constexpr size_t kRingBufferCapacity = 256 * 1024;
-constexpr size_t kRecvBufferSize = 16 * 1024;
-constexpr size_t kParseChunkSize = 8192;
+constexpr size_t kRingBufferCapacity = 1u << 20; // 1 MiB
 constexpr int kModulo = 997;
 constexpr int kComputeWorkers = 7;
 constexpr int kMaxMatrixDim = 512;
-}  // namespace
+constexpr size_t kMaxCells = static_cast<size_t>(kMaxMatrixDim) * static_cast<size_t>(kMaxMatrixDim);
+} // namespace
 
-struct Job {
+struct SharedJob {
     int challenge_id = 0;
     int N = 0;
     vector<int> A;
     vector<int> B;
+    array<int, kComputeWorkers> partials{};
+    atomic<uint64_t> epoch{0};
+    atomic<int> done_count{0};
+
+    SharedJob() : A(kMaxCells), B(kMaxCells) {}
 };
 
-class RingBuffer {
+class SpscRingBuffer {
 public:
-    explicit RingBuffer(size_t capacity)
-        : buffer_(capacity) {}
+    explicit SpscRingBuffer(size_t capacity)
+        : buffer_(capacity), mask_(capacity - 1) {}
+
+    char* reserveWriteSpan(size_t& span_out) {
+        if (closed_.load(memory_order_acquire)) {
+            span_out = 0;
+            return nullptr;
+        }
+
+        const size_t head = head_.load(memory_order_relaxed);
+        const size_t tail = tail_.load(memory_order_acquire);
+        const size_t used = head - tail;
+        if (used == buffer_.size()) {
+            writer_waits_.fetch_add(1, memory_order_relaxed);
+            span_out = 0;
+            return nullptr;
+        }
+
+        const size_t free = buffer_.size() - used;
+        const size_t idx = head & mask_;
+        span_out = min(free, buffer_.size() - idx);
+        return buffer_.data() + idx;
+    }
+
+    void commitWrite(size_t n) {
+        head_.fetch_add(n, memory_order_release);
+    }
+
+    const char* peekReadSpan(size_t& span_out) {
+        const size_t tail = tail_.load(memory_order_relaxed);
+        const size_t head = head_.load(memory_order_acquire);
+        const size_t used = head - tail;
+        if (used == 0) {
+            if (closed_.load(memory_order_acquire)) {
+                span_out = 0;
+                return nullptr;
+            }
+            reader_waits_.fetch_add(1, memory_order_relaxed);
+            span_out = 0;
+            return nullptr;
+        }
+
+        const size_t idx = tail & mask_;
+        span_out = min(used, buffer_.size() - idx);
+        return buffer_.data() + idx;
+    }
+
+    void consume(size_t n) {
+        tail_.fetch_add(n, memory_order_release);
+    }
 
     void close() {
-        lock_guard<mutex> lock(mutex_);
-        closed_ = true;
-        not_empty_.notify_all();
-        not_full_.notify_all();
+        closed_.store(true, memory_order_release);
     }
 
-    bool write(const char* data, size_t len) {
-        size_t written = 0;
-        unique_lock<mutex> lock(mutex_);
-
-        while (written < len) {
-            not_full_.wait(lock, [&] { return closed_ || size_used_ < buffer_.size(); });
-            if (closed_) {
-                return false;
-            }
-
-            size_t space = buffer_.size() - size_used_;
-            if (space == 0) {
-                continue;
-            }
-
-            size_t chunk = min(space, len - written);
-            size_t first = min(chunk, buffer_.size() - write_pos_);
-            memcpy(buffer_.data() + write_pos_, data + written, first);
-            write_pos_ = (write_pos_ + first) % buffer_.size();
-            size_used_ += first;
-            written += first;
-
-            size_t second = chunk - first;
-            if (second > 0) {
-                memcpy(buffer_.data() + write_pos_, data + written, second);
-                write_pos_ = (write_pos_ + second) % buffer_.size();
-                size_used_ += second;
-                written += second;
-            }
-
-            not_empty_.notify_one();
-        }
-
-        return true;
+    bool closed() const {
+        return closed_.load(memory_order_acquire);
     }
 
-    size_t read(char* out, size_t max_len) {
-        unique_lock<mutex> lock(mutex_);
-        not_empty_.wait(lock, [&] { return closed_ || size_used_ > 0; });
+    uint64_t writerWaits() const {
+        return writer_waits_.load(memory_order_relaxed);
+    }
 
-        if (size_used_ == 0 && closed_) {
-            return 0;
-        }
-
-        size_t chunk = min(max_len, size_used_);
-        size_t first = min(chunk, buffer_.size() - read_pos_);
-        memcpy(out, buffer_.data() + read_pos_, first);
-        read_pos_ = (read_pos_ + first) % buffer_.size();
-        size_used_ -= first;
-
-        size_t second = chunk - first;
-        if (second > 0) {
-            memcpy(out + first, buffer_.data() + read_pos_, second);
-            read_pos_ = (read_pos_ + second) % buffer_.size();
-            size_used_ -= second;
-        }
-
-        not_full_.notify_one();
-        return chunk;
+    uint64_t readerWaits() const {
+        return reader_waits_.load(memory_order_relaxed);
     }
 
 private:
     vector<char> buffer_;
-    size_t read_pos_ = 0;
-    size_t write_pos_ = 0;
-    size_t size_used_ = 0;
-    bool closed_ = false;
-    mutex mutex_;
-    condition_variable not_empty_;
-    condition_variable not_full_;
+    const size_t mask_;
+    atomic<size_t> head_{0}; // producer-owned
+    atomic<size_t> tail_{0}; // consumer-owned
+    atomic<bool> closed_{false};
+    atomic<uint64_t> writer_waits_{0};
+    atomic<uint64_t> reader_waits_{0};
 };
 
-class JobQueue {
+class ChallengeParser {
 public:
-    void push(unique_ptr<Job> job) {
-        lock_guard<mutex> lock(mutex_);
-        if (closed_) {
-            return;
+    explicit ChallengeParser(SharedJob& job) : job_(job) {}
+
+    size_t feed(const char* data, size_t len) {
+        size_t i = 0;
+        for (; i < len && !completed_; ++i) {
+            processChar(data[i]);
         }
-        queue_.push(std::move(job));
-        cv_.notify_one();
+        return i;
     }
 
-    bool pop(unique_ptr<Job>& job) {
-        unique_lock<mutex> lock(mutex_);
-        cv_.wait(lock, [&] { return closed_ || !queue_.empty(); });
-        if (queue_.empty()) {
-            return false;
-        }
-        job = std::move(queue_.front());
-        queue_.pop();
-        return true;
+    bool completed() const {
+        return completed_;
     }
 
-    void close() {
-        lock_guard<mutex> lock(mutex_);
-        closed_ = true;
-        cv_.notify_all();
-    }
-
-private:
-    queue<unique_ptr<Job>> queue_;
-    bool closed_ = false;
-    mutex mutex_;
-    condition_variable cv_;
-};
-
-class ChallengeStreamParser {
-public:
-    explicit ChallengeStreamParser(int max_matrix_dim)
-        : max_matrix_dim_(max_matrix_dim) {}
-
-    template <typename EmitFn>
-    void feed(const char* data, size_t len, EmitFn& emit) {
-        for (size_t i = 0; i < len; ++i) {
-            processChar(data[i], emit);
-        }
-    }
-
-    template <typename EmitFn>
-    void finish(EmitFn& emit) {
-        if (in_number_) {
-            finalizeNumber(emit);
-        }
+    void reset() {
+        phase_ = Phase::ChallengeId;
+        in_number_ = false;
+        sign_ = 1;
+        current_value_ = 0;
+        a_index_ = 0;
+        b_index_ = 0;
+        completed_ = false;
     }
 
 private:
@@ -179,9 +147,8 @@ private:
         B
     };
 
-    template <typename EmitFn>
-    void processChar(char c, EmitFn& emit) {
-        unsigned char uc = static_cast<unsigned char>(c);
+    void processChar(char c) {
+        const unsigned char uc = static_cast<unsigned char>(c);
 
         if (isdigit(uc)) {
             if (!in_number_) {
@@ -200,12 +167,12 @@ private:
 
         if (isspace(uc)) {
             if (in_number_) {
-                finalizeNumber(emit);
+                finalizeNumber();
             }
             return;
         }
 
-        resetChallenge();
+        reset();
     }
 
     void startNumber() {
@@ -214,93 +181,71 @@ private:
         current_value_ = 0;
     }
 
-    template <typename EmitFn>
-    void finalizeNumber(EmitFn& emit) {
-        int value = sign_ * current_value_;
+    size_t totalCells() const {
+        return static_cast<size_t>(job_.N) * static_cast<size_t>(job_.N);
+    }
+
+    void finalizeNumber() {
+        const int value = sign_ * current_value_;
         in_number_ = false;
         sign_ = 1;
         current_value_ = 0;
 
         switch (phase_) {
             case Phase::ChallengeId:
-                challenge_id_ = value;
+                job_.challenge_id = value;
                 phase_ = Phase::N;
                 break;
 
-            case Phase::N: {
-                if (value <= 0 || value > max_matrix_dim_) {
-                    resetChallenge();
+            case Phase::N:
+                if (value <= 0 || value > kMaxMatrixDim) {
+                    reset();
                     break;
                 }
-
-                N_ = value;
-                const size_t total = static_cast<size_t>(N_) * static_cast<size_t>(N_);
-                A_.assign(total, 0);
-                B_.assign(total, 0);
+                job_.N = value;
                 a_index_ = 0;
                 b_index_ = 0;
                 phase_ = Phase::A;
                 break;
-            }
 
-            case Phase::A:
-                if (a_index_ < A_.size()) {
-                    A_[a_index_++] = value;
+            case Phase::A: {
+                const size_t total = totalCells();
+                if (a_index_ < total) {
+                    job_.A[a_index_++] = value;
                 }
-                if (a_index_ == A_.size()) {
+                if (a_index_ == total) {
                     phase_ = Phase::B;
                 }
                 break;
+            }
 
-            case Phase::B:
-                if (b_index_ < B_.size()) {
-                    B_[b_index_++] = value;
+            case Phase::B: {
+                const size_t total = totalCells();
+                if (b_index_ < total) {
+                    job_.B[b_index_++] = value;
                 }
-                if (b_index_ == B_.size()) {
-                    auto job = make_unique<Job>();
-                    job->challenge_id = challenge_id_;
-                    job->N = N_;
-                    job->A = std::move(A_);
-                    job->B = std::move(B_);
-                    emit(std::move(job));
-                    resetChallenge();
+                if (b_index_ == total) {
+                    completed_ = true;
                 }
                 break;
+            }
         }
     }
 
-    void resetChallenge() {
-        phase_ = Phase::ChallengeId;
-        challenge_id_ = 0;
-        N_ = 0;
-        a_index_ = 0;
-        b_index_ = 0;
-        A_.clear();
-        B_.clear();
-        in_number_ = false;
-        sign_ = 1;
-        current_value_ = 0;
-    }
-
+    SharedJob& job_;
     Phase phase_ = Phase::ChallengeId;
     bool in_number_ = false;
     int sign_ = 1;
     int current_value_ = 0;
-    int challenge_id_ = 0;
-    int N_ = 0;
     size_t a_index_ = 0;
     size_t b_index_ = 0;
-    vector<int> A_;
-    vector<int> B_;
-    int max_matrix_dim_ = 0;
+    bool completed_ = false;
 };
 
-static bool sendAll(int sock, const string& msg, mutex& send_mutex, atomic<bool>& stop_requested) {
-    lock_guard<mutex> lock(send_mutex);
-
+static bool sendAll(int sock, const string& msg) {
     size_t sent = 0;
     while (sent < msg.size()) {
-        ssize_t n = send(sock, msg.data() + sent, msg.size() - sent, 0);
+        const ssize_t n = send(sock, msg.data() + sent, msg.size() - sent, 0);
         if (n > 0) {
             sent += static_cast<size_t>(n);
             continue;
@@ -308,99 +253,132 @@ static bool sendAll(int sock, const string& msg, mutex& send_mutex, atomic<bool>
         if (n < 0 && errno == EINTR) {
             continue;
         }
-
-        stop_requested.store(true);
         return false;
     }
-
     return true;
 }
 
-static int computeChecksum(const Job& job) {
+static int computePartialChecksum(const SharedJob& job, int worker_id) {
     const int N = job.N;
-    const vector<int>& A = job.A;
-    const vector<int>& B = job.B;
+    const size_t start_row = (static_cast<size_t>(worker_id) * static_cast<size_t>(N)) / kComputeWorkers;
+    const size_t end_row = (static_cast<size_t>(worker_id + 1) * static_cast<size_t>(N)) / kComputeWorkers;
 
-    int checksum = 0;
-    for (int i = 0; i < N; ++i) {
-        const int row_base = i * N;
+    int partial = 0;
+    for (size_t i = start_row; i < end_row; ++i) {
+        const size_t row_base = i * static_cast<size_t>(N);
         for (int j = 0; j < N; ++j) {
             int cij = 0;
             for (int k = 0; k < N; ++k) {
-                int term = static_cast<int>((1LL * A[row_base + k] * B[k * N + j]) % kModulo);
+                const int term = static_cast<int>((1LL * job.A[row_base + static_cast<size_t>(k)] * job.B[static_cast<size_t>(k) * static_cast<size_t>(N) + static_cast<size_t>(j)]) % kModulo);
                 cij += term;
                 if (cij >= kModulo) {
                     cij -= kModulo;
                 }
             }
-            checksum += cij;
-            if (checksum >= kModulo) {
-                checksum -= kModulo;
+            partial += cij;
+            if (partial >= kModulo) {
+                partial -= kModulo;
             }
         }
     }
 
-    return checksum;
+    return partial;
 }
 
-static void ioReceiverThread(int sock, RingBuffer& ring, atomic<bool>& stop_requested) {
-    vector<char> recv_buffer(kRecvBufferSize);
-
-    while (!stop_requested.load()) {
-        ssize_t n = recv(sock, recv_buffer.data(), recv_buffer.size(), 0);
-        if (n > 0) {
-            if (!ring.write(recv_buffer.data(), static_cast<size_t>(n))) {
+static void ioReceiverThread(int sock, SpscRingBuffer& ring, atomic<bool>& stop_requested) {
+    while (!stop_requested.load(memory_order_relaxed)) {
+        size_t span = 0;
+        char* dst = ring.reserveWriteSpan(span);
+        if (span == 0) {
+            if (ring.closed()) {
                 break;
             }
+            this_thread::yield();
+            continue;
+        }
+
+        const ssize_t n = recv(sock, dst, span, 0);
+        if (n > 0) {
+            ring.commitWrite(static_cast<size_t>(n));
             continue;
         }
 
         if (n < 0 && errno == EINTR) {
             continue;
         }
-
         break;
     }
 
-    stop_requested.store(true);
+    stop_requested.store(true, memory_order_relaxed);
     ring.close();
 }
 
-static void parserThread(RingBuffer& ring, JobQueue& jobs, atomic<bool>& stop_requested) {
-    ChallengeStreamParser parser(kMaxMatrixDim);
-    vector<char> chunk(kParseChunkSize);
+static void workerThread(int worker_id, SharedJob& job, atomic<bool>& stop_requested) {
+    uint64_t seen_epoch = 0;
 
-    auto emit = [&](unique_ptr<Job> job) {
-        jobs.push(std::move(job));
-    };
+    while (!stop_requested.load(memory_order_relaxed)) {
+        const uint64_t epoch = job.epoch.load(memory_order_acquire);
+        if (epoch == seen_epoch) {
+            this_thread::yield();
+            continue;
+        }
 
-    while (!stop_requested.load()) {
-        size_t n = ring.read(chunk.data(), chunk.size());
-        if (n == 0) {
+        seen_epoch = epoch;
+        if (stop_requested.load(memory_order_relaxed)) {
             break;
         }
 
-        parser.feed(chunk.data(), n, emit);
+        job.partials[worker_id] = computePartialChecksum(job, worker_id);
+        job.done_count.fetch_add(1, memory_order_release);
     }
-
-    parser.finish(emit);
-    jobs.close();
 }
 
-static void computeWorkerThread(int sock, JobQueue& jobs, mutex& send_mutex, atomic<bool>& stop_requested) {
-    while (!stop_requested.load()) {
-        unique_ptr<Job> job;
-        if (!jobs.pop(job)) {
+static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& stop_requested, int sock) {
+    ChallengeParser parser(job);
+
+    while (!stop_requested.load(memory_order_relaxed)) {
+        size_t span = 0;
+        const char* src = ring.peekReadSpan(span);
+        if (span == 0) {
+            if (ring.closed()) {
+                break;
+            }
+            this_thread::yield();
+            continue;
+        }
+
+        const size_t consumed = parser.feed(src, span);
+        ring.consume(consumed);
+
+        if (!parser.completed()) {
+            continue;
+        }
+
+        job.done_count.store(0, memory_order_release);
+        job.epoch.fetch_add(1, memory_order_release);
+
+        while (job.done_count.load(memory_order_acquire) < kComputeWorkers) {
+            if (stop_requested.load(memory_order_relaxed)) {
+                break;
+            }
+            this_thread::yield();
+        }
+
+        int checksum = 0;
+        for (int i = 0; i < kComputeWorkers; ++i) {
+            checksum += job.partials[i];
+            if (checksum >= kModulo) {
+                checksum -= kModulo;
+            }
+        }
+
+        const string response = to_string(job.challenge_id) + " " + to_string(checksum) + "\n";
+        if (!sendAll(sock, response)) {
+            stop_requested.store(true, memory_order_relaxed);
             break;
         }
 
-        int checksum = computeChecksum(*job);
-        string response = to_string(job->challenge_id) + " " + to_string(checksum) + "\n";
-
-        if (!sendAll(sock, response, send_mutex, stop_requested)) {
-            jobs.close();
-            break;
-        }
+        parser.reset();
     }
 }
 
@@ -410,9 +388,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    string host = argv[1];
-    int port = stoi(argv[2]);
-    string team = argv[3];
+    const string host = argv[1];
+    const int port = stoi(argv[2]);
+    const string team = argv[3];
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
@@ -436,17 +414,8 @@ int main(int argc, char** argv) {
     }
 
     const string intro = team + "\n";
-    size_t intro_sent = 0;
-    while (intro_sent < intro.size()) {
-        ssize_t n = send(sock, intro.data() + intro_sent, intro.size() - intro_sent, 0);
-        if (n > 0) {
-            intro_sent += static_cast<size_t>(n);
-            continue;
-        }
-        if (n < 0 && errno == EINTR) {
-            continue;
-        }
-        perror("send");
+    if (!sendAll(sock, intro)) {
+        cerr << "Failed to send team name.\n";
         close(sock);
         return 1;
     }
@@ -454,26 +423,33 @@ int main(int argc, char** argv) {
     cout << "Connected to server at " << host << ":" << port << '\n';
     cout << "Waiting for challenges...\n";
 
-    RingBuffer ring(kRingBufferCapacity);
-    JobQueue jobs;
+    SharedJob job;
+    SpscRingBuffer ring(kRingBufferCapacity);
     atomic<bool> stop_requested{false};
-    mutex send_mutex;
+
+    array<thread, kComputeWorkers> workers;
+    for (int i = 0; i < kComputeWorkers; ++i) {
+        workers[i] = thread(workerThread, i, ref(job), ref(stop_requested));
+    }
 
     thread io_thread(ioReceiverThread, sock, ref(ring), ref(stop_requested));
-    thread parse_thread(parserThread, ref(ring), ref(jobs), ref(stop_requested));
-
-    vector<thread> workers;
-    workers.reserve(kComputeWorkers);
-    for (int i = 0; i < kComputeWorkers; ++i) {
-        workers.emplace_back(computeWorkerThread, sock, ref(jobs), ref(send_mutex), ref(stop_requested));
-    }
+    thread parse_thread(parserThread, ref(ring), ref(job), ref(stop_requested), sock);
 
     io_thread.join();
     parse_thread.join();
+
+    stop_requested.store(true, memory_order_relaxed);
+    job.epoch.fetch_add(1, memory_order_release);
+
     for (auto& worker : workers) {
-        worker.join();
+        if (worker.joinable()) {
+            worker.join();
+        }
     }
 
     close(sock);
+
+    cout << "Ring writer waits: " << ring.writerWaits() << '\n';
+    cout << "Ring reader waits: " << ring.readerWaits() << '\n';
     return 0;
 }
