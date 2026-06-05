@@ -8,16 +8,10 @@
 #include <cstdio>
 #include <cstring>
 #include <netinet/in.h>
-#include <netinet/tcp.h>
-#include <pthread.h>
 #include <string>
 #include <thread>
 #include <unistd.h>
 #include <vector>
-
-#ifdef __APPLE__
-#include <sys/qos.h>
-#endif
 
 using namespace std;
 using namespace std::chrono;
@@ -25,18 +19,11 @@ using namespace std::chrono;
 namespace {
 constexpr size_t kRingBufferCapacity = 1u << 20; // 1 MiB
 constexpr int kModulo = 997;
-constexpr int kComputeWorkers = 8;
+constexpr int kComputeWorkers = 7;
 constexpr int kMaxMatrixDim = 512;
-constexpr int kComputeTile = 64;
-constexpr int kSocketRecvBufferBytes = 1 << 22;
+constexpr int kComputeTile = 32;
 constexpr size_t kMaxCells = static_cast<size_t>(kMaxMatrixDim) * static_cast<size_t>(kMaxMatrixDim);
 } // namespace
-
-static void markComputeThread() {
-#ifdef __APPLE__
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
-#endif
-}
 
 struct BenchmarkStats {
     atomic<uint64_t> challenges{0};
@@ -56,7 +43,6 @@ struct SharedJob {
     array<int, kComputeWorkers> partials{};
     atomic<uint64_t> epoch{0};
     atomic<int> done_count{0};
-    atomic<int> next_tile{0};
 
     SharedJob() : A(kMaxCells), B(kMaxCells) {}
 };
@@ -287,10 +273,10 @@ private:
     steady_clock::time_point challenge_start_{};
 };
 
-static bool sendAll(int sock, const char* msg, size_t size) {
+static bool sendAll(int sock, const string& msg) {
     size_t sent = 0;
-    while (sent < size) {
-        const ssize_t n = send(sock, msg + sent, size - sent, 0);
+    while (sent < msg.size()) {
+        const ssize_t n = send(sock, msg.data() + sent, msg.size() - sent, 0);
         if (n > 0) {
             sent += static_cast<size_t>(n);
             continue;
@@ -303,53 +289,36 @@ static bool sendAll(int sock, const char* msg, size_t size) {
     return true;
 }
 
-static bool sendAll(int sock, const string& msg) {
-    return sendAll(sock, msg.data(), msg.size());
-}
-
-static int computePartialChecksum(SharedJob& job, int worker_id) {
-    (void)worker_id;
+static int computePartialChecksum(const SharedJob& job, int worker_id) {
     const int N = job.N;
-    const int row_tiles = (N + kComputeTile - 1) / kComputeTile;
-    const int k_tiles = (N + kComputeTile - 1) / kComputeTile;
-    const int j_tiles = (N + kComputeTile - 1) / kComputeTile;
-    const int total_tiles = row_tiles * k_tiles * j_tiles;
+    const size_t start_row = (static_cast<size_t>(worker_id) * static_cast<size_t>(N)) / kComputeWorkers;
+    const size_t end_row = (static_cast<size_t>(worker_id + 1) * static_cast<size_t>(N)) / kComputeWorkers;
 
-    int64_t partial = 0;
-
-    while (true) {
-        const int tile = job.next_tile.fetch_add(1, memory_order_relaxed);
-        if (tile >= total_tiles) {
-            break;
-        }
-
-        const int j_tile = tile % j_tiles;
-        const int k_tile = (tile / j_tiles) % k_tiles;
-        const int i_tile = tile / (j_tiles * k_tiles);
-
-        const size_t ii = static_cast<size_t>(i_tile * kComputeTile);
-        const int kk = k_tile * kComputeTile;
-        const int jj = j_tile * kComputeTile;
-        const size_t i_end = min(static_cast<size_t>(N), ii + static_cast<size_t>(kComputeTile));
-        const int k_end = min(N, kk + kComputeTile);
-        const int j_end = min(N, jj + kComputeTile);
-
-        for (size_t i = ii; i < i_end; ++i) {
-            const size_t row_base = i * static_cast<size_t>(N);
-            for (int k = kk; k < k_end; ++k) {
-                const int a = job.A[row_base + static_cast<size_t>(k)];
-                const size_t b_base = static_cast<size_t>(k) * static_cast<size_t>(N);
-                if (k + 1 < k_end) {
-                    __builtin_prefetch(job.B.data() + static_cast<size_t>(k + 1) * static_cast<size_t>(N) + static_cast<size_t>(jj), 0, 1);
-                }
-                for (int j = jj; j < j_end; ++j) {
-                    partial += static_cast<int64_t>(a) * static_cast<int64_t>(job.B[b_base + static_cast<size_t>(j)]);
+    int partial = 0;
+    for (size_t ii = start_row; ii < end_row; ii += static_cast<size_t>(kComputeTile)) {
+        const size_t i_end = min(end_row, ii + static_cast<size_t>(kComputeTile));
+        for (int kk = 0; kk < N; kk += kComputeTile) {
+            const int k_end = min(N, kk + kComputeTile);
+            for (int jj = 0; jj < N; jj += kComputeTile) {
+                const int j_end = min(N, jj + kComputeTile);
+                for (size_t i = ii; i < i_end; ++i) {
+                    const size_t row_base = i * static_cast<size_t>(N);
+                    for (int k = kk; k < k_end; ++k) {
+                        const int a = job.A[row_base + static_cast<size_t>(k)];
+                        const size_t b_base = static_cast<size_t>(k) * static_cast<size_t>(N);
+                        for (int j = jj; j < j_end; ++j) {
+                            partial += static_cast<int>((1LL * a * job.B[b_base + static_cast<size_t>(j)]) % kModulo);
+                            if (partial >= kModulo) {
+                                partial -= kModulo;
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
-    return static_cast<int>(partial % kModulo);
+    return partial;
 }
 
 static void ioReceiverThread(int sock, SpscRingBuffer& ring, atomic<bool>& stop_requested, BenchmarkStats* stats) {
@@ -384,8 +353,6 @@ static void ioReceiverThread(int sock, SpscRingBuffer& ring, atomic<bool>& stop_
 }
 
 static void workerThread(int worker_id, SharedJob& job, atomic<bool>& stop_requested) {
-    markComputeThread();
-
     uint64_t seen_epoch = 0;
 
     while (!stop_requested.load(memory_order_relaxed)) {
@@ -438,7 +405,6 @@ static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& sto
         }
 
         const auto compute_start = parse_complete;
-        job.next_tile.store(0, memory_order_relaxed);
         job.done_count.store(0, memory_order_release);
         job.epoch.fetch_add(1, memory_order_release);
 
@@ -463,13 +429,12 @@ static void parserThread(SpscRingBuffer& ring, SharedJob& job, atomic<bool>& sto
             }
         }
 
-        char response[64];
-        const int response_len = snprintf(response, sizeof(response), "%d %d\n", job.challenge_id, checksum);
+        const string response = to_string(job.challenge_id) + " " + to_string(checksum) + "\n";
         steady_clock::time_point send_start;
         if (stats != nullptr) {
             send_start = steady_clock::now();
         }
-        if (response_len <= 0 || !sendAll(sock, response, static_cast<size_t>(response_len))) {
+        if (!sendAll(sock, response)) {
             stop_requested.store(true, memory_order_relaxed);
             break;
         }
@@ -505,11 +470,6 @@ int main(int argc, char** argv) {
         perror("socket");
         return 1;
     }
-
-    int one = 1;
-    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    int recv_buffer = kSocketRecvBufferBytes;
-    setsockopt(sock, SOL_SOCKET, SO_RCVBUF, &recv_buffer, sizeof(recv_buffer));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
